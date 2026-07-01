@@ -1,0 +1,670 @@
+---
+title: "Hunting Spillover Model"
+output: 
+  html_document:
+    theme: journal
+    toc: yes
+    toc_float:
+      collapsed: true
+date: "2025-06-02"
+author: "Ayrton/Lucas"
+---
+
+## Model structure
+
+$$
+\begin{align}
+\frac{dH_S}{dt} &= -H_s \left[
+\underbrace{(1 - e^{-\Gamma_D(t)})}_{\text{Direct spillover}} + \underbrace{(1 - e^{-\Gamma_V(t)})}_{\text{Vector spillover}}\right] \\
+
+\frac{dH_I}{dt} &=  \left[
+\underbrace{(1 - e^{-\Gamma_D(t)})}_{\text{Direct spillover}} + \underbrace{(1 - e^{-\Gamma_V(t)})}_{\text{Vector spillover}}\right] \\
+
+\frac{dC_S}{dt} &=  -C_S \left[
+\underbrace{(1 - e^{-\Gamma_C(t)})}_{\text{Direct spillover} }\right] \\
+
+\frac{dC_S}{dt} &= C_S \left[
+\underbrace{(1 - e^{-\Gamma_C(t)})}_{\text{Direct spillover} }\right] \\
+
+
+\frac{dA_S}{dt} &= rA\left(1 - \frac{A + I_a}{K_{\text{eff}}}\right) - h_{\text{eff}}A - \mu A -\lambda A \frac{ I_a}{A + I_a} \\
+
+\frac{dA_I}{dt} &= \lambda A \frac{ I_a}{A + I_a} - h_{\text{eff}}I_a - \mu I_a \\
+
+\frac{dP}{dt} &= \Phi I_A\left(1 - \frac{I_A}{K_{\text{P}}}\right) - \nu P  \\
+\end{align}
+$$
+where:
+
+$$
+\Gamma_D(t) = T h_{\text{eff}} (\gamma_I + \gamma_P + \gamma_E) \frac{I_a}{I_a + A} + T \eta \gamma_F P
+$$
+
+$$
+\begin{align}
+\gamma_j &= \rho_j w_j \psi l_j, \quad j \in \{I, P, E\} \\
+\gamma_F &= \rho_F w_F
+\end{align}
+$$
+
+$$
+\Gamma_V = T \omega p_V l_v \frac{I_a}{I_a + A}
+$$
+
+$$
+\Gamma_D(t) = T h_{\text{eff}} (\gamma_P + \gamma_E) \frac{I_a}{I_a + A}
+$$
+
+
+| Parameter | Description |
+|-----------|-------------|
+| $h_{\text{eff}}$ | Hunting success rate |
+| $r$ | Animal growth rate |
+| $K_{\text{op,eff}}$ | Carrying capacity |
+| $\mu$ | Probability of death |
+| $\Phi$ | Pathogen shedding rate |
+| $\nu$ | Pathogen inactivation rate |
+| $K_P$ | Max number of pathogens |
+| $w_F$ | Weight of fomites on transmission |
+| $w_I$ | Weight of injuries on transmission |
+| $w_P$ | Weight of processing on transmission |
+| $w_E$ | Weight of eating on transmission |
+| $\rho_I$ | Probability of infection due to injury |
+| $\rho_P$ | Probability of infection due to processing |
+| $\rho_E$ | Probability of infection due to eating |
+| $l_I$ | Probability of being injured |
+| $l_P$ | Probability of cut during processing |
+| $l_E$ | Probability of eating raw/rare meat |
+| $\eta$ | Pathogen contact rate |
+| $T$ | Time in huntings
+| $\rho_V$ | Probability of infection by biting |
+| $\omega$ | Number of encounters |
+| $l_V$ | Probability of bite during encounter |
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# Load packages
+pacman::p_load(tidyverse, deSolve, magrittr, ggpubr, formattable, YAML)
+
+# Load precipitation functions
+source("./new/prep_functions.R")
+```
+
+## Model Configuration
+
+```{r config}
+# Simulation parameters
+n_years <- 2
+total_days <- n_years * 365
+tempo <- seq(1, total_days, by = 1)
+lanina_years <- c(0)
+
+# NOVA FUNCIONALIDADE: Configuração de cenários
+scenario_config <- list(
+  baseline = list(name = "Baseline", hunt_intensity = 1.0, vector_season = FALSE),
+  high_hunting = list(name = "High Hunting", hunt_intensity = 2.0, vector_season = FALSE),
+  vector_season = list(name = "Vector Season", hunt_intensity = 1.0, vector_season = TRUE),
+  combined = list(name = "High Hunt + Vectors", hunt_intensity = 2.0, vector_season = TRUE)
+)
+
+# Escolher cenário atual
+current_scenario <- scenario_config$baseline
+
+# Model parameters - MELHORADO: Parâmetros mais realistas
+pars <- list(
+  
+  # DEMOGRAPH
+ # n_hunters = 100,
+#  n_family = 400,
+  
+  # HUNTING
+  h = 0.1 * current_scenario$hunt_intensity,  # hunting efficiency (scenario-dependent)
+  h_sazo = 0.01,             # seasonal increase 
+  base_time_forest = 4,      # average daily hunting time (hours)
+  time_max_optimal = 6,      # increased max hunting time
+  hunt_days = c(6,7),        # weekend hunting 
+  hunter_experience = 0,     # experience factor
+ 
+  
+  # ANIMALS
+  r = 0.25,                  # daily growth rate
+  K_max = 1500,              # maximum carrying capacity
+  K_sazo = 0.85,             # seasonal decrease
+  mu = 0.05,                 # daily mortality
+  lambda_base = 0.08,        # baseline transmission rate
+  lambda_agg_boost = 1.2,    # stronger aggregation effect
+  migration_rate = 0,        # migration rate  
+  
+  # PATHOGENS
+  phi = 50,                   # shedding rate
+  nu = 0.7,                   # slower pathogen decay
+  P_max = 1e6,                # max pathogen load
+  pathogen_seasonality = 0.3, #seasonal pathogen survival
+  
+  # SPILLOVER - Direct transmission (pathogen 1) - for hunters
+  injurie_risk = 0, p_I = 0, w_injuries = 0,     #  injury risk
+  processing_risk = 0, p_P = 0, w_processing = 0, #  processing risk
+  eating_risk = 0.5, p_E = 1, w_eating = 1,         #  eating risk
+  cont_rate = 0, p_F = 0, w_fomites = 0,          #  fomite risk
+  protective_equipment = 0, #  PPE usage rate
+  
+  ## for consumers
+  
+  sharing_fraction = 0.75,     # meat shared fraction
+  home_processing_risk = 0,# home processing risk
+  home_eating_risk = 0.25,   # home eating risk
+  home_ppe_effect = 0,      # PPE at home
+  cooking_protection = 0,   # risk reduction by cooking
+  
+  
+  # SPILLOVER - Vector transmission (pathogen 2)
+  encounters_day = ifelse(current_scenario$vector_season, 25, 10), # seasonal vectors (pensando em usar)
+  p_V = 0.05,               #  higher infection probability
+  bite_risk = 0.2,          #  higher bite risk
+  vector_seasonality = 0    #  seasonal vector activity
+)
+
+# Initial conditions
+state <- c(
+  Sh = 100,               # Hunters S
+  Ih = 0,                 # Hunters I
+  Sc = 400,               # Consumers S
+  Ic = 0,                 # Consumers I
+  A = 800,                # Animals S
+  Ia = 100,               # Animals I
+  P = 0                   # Pathogen in the enviroment
+)
+```
+
+## Data Generation
+
+```{r data_generation}
+# Generate precipitation data
+precipitation_data <- generate_precipitation_dataset(
+  years = n_years,
+  la_nina_years = lanina_years,  
+  nina_intensity = 1.5,
+  drought_periods = create_periods(c(0,0,0), c(0,0,0)),
+  flood_periods = create_periods(c(0,0), c(0,0)),
+  flood_intensity = 3
+) %>%
+  mutate(p_normalizado = (precipitation - min(precipitation)) / 
+                        (max(precipitation) - min(precipitation)))
+```
+
+
+```{r}
+
+precip1 <- precipitation_data %>% 
+  filter(year == 1) %>% 
+  ggplot() + 
+  #geom_vline(xintercept = 365, linetype = 2) +
+  geom_line(aes(x = day, y = precipitation), color = "skyblue3") + 
+  #geom_text(label = "1 year", x=350, y=6, angle = 90) +
+  labs(x = "Day", y = "Daily precipitation volume (mm)") + 
+  theme_bw(base_size = 12) +
+  scale_x_continuous(expand = c(0, 0), breaks = seq(0, 365, 50)); precip1  # A cada 30 dias
+
+ggsave("./book_chapter/precip1.png",precip1,dpi = 300,width = 6,height = 4)
+
+precip2 <- precipitation_data %>% 
+  mutate(month_name = month(date, label = T)) %>% 
+  filter(year == 1) %>% 
+  ggplot() +
+  geom_col(aes(x = month_name, precipitation), fill = "skyblue3") +
+  labs(x = "Month", y = "Montlhy precipitation volume (mm)") +
+  theme_bw(base_size = 12); precip2
+
+ggsave("./book_chapter/precip2.png",precip2,dpi = 300, width = 6,height = 4)
+
+```
+
+
+
+## Model Definition
+
+```{r model_definition}
+spillover_model <- function(t, state, pars, p_data) {
+  with(as.list(c(state, pars)), {
+    
+    # Time indexing
+    t_int <- pmax(1, pmin(floor(t), length(p_data)))
+    p_norm <- p_data[t_int]
+    
+    # Climate-dependent effects with more complexity
+    threshold <- 0.7  #  lower threshold for more sensitivity
+    clim_effect <- pmax(0, 0.3 * (p_norm - threshold) / (1 - threshold))
+    agg_factor <- 1 + clim_effect
+    
+    #  Seasonal pathogen survival
+    #pathogen_survival_factor <- 1 + pathogen_seasonality * sin(2 * pi * t / 365)
+    
+    # carrying capacity
+   # seasonal_factor <- 0.8 + 0.4 * sin(2 * pi * (t - 90) / 365)  # vector peak in summer  (not used)
+    K_effective <- K_max * (K_sazo + (1 - K_sazo) * (1 - p_norm))
+    
+    lambda_effective <- lambda_base * (1 + (agg_factor - 1) * lambda_agg_boost) # * pathogen_survival_factor
+    
+    # Hunting schedule with experience factor
+    weekday <- (floor(t) %% 7) + 1  
+    is_hunting_day <- ifelse(weekday %in% hunt_days, 1, 0)
+    
+    #  Weather-dependent hunting (hunters avoid rain)
+    weather_factor <- ifelse(p_norm > 0.8, 0, 1.0)  # stop hunting in heavy rain
+    
+    #  More complex time in forest calculation
+    optimal_climate <- 0.4  # optimal precipitation level for hunting
+    climate_hunting_factor <- 1 - 0.5 * abs(p_norm - optimal_climate)
+    
+    time_in_forest_base <- (base_time_forest + 
+                           (time_max_optimal - base_time_forest) * 
+                           climate_hunting_factor) / 24 #* hunter_experience) / 24
+    
+    # Effective rates on hunting days only
+    time_in_forest <- is_hunting_day * time_in_forest_base * weather_factor
+    hunting_rate <- is_hunting_day * h * (1 + h_sazo * p_norm) #* hunter_experience
+    
+     # Inicializa derivadas
+      dSh <- dIh <- dSc <- dIc <- dA <- dIa <- dP <- 0
+      hunter_spillover_prob <- 0
+      consumer_spillover_prob <- 0
+
+      
+      # ------------------------------------------------------------
+      # DINÂMICA DOS CAÇADORES (PRODUTORES)
+      # ------------------------------------------------------------
+      if (is_hunting_day == 1 && time_in_forest > 0) {
+        animal_prop <- ifelse((Ia + A) > 0, Ia / (Ia + A), 0)
+        
+        # Componentes de risco para caçadores
+        injury_risk_component <- injurie_risk * w_injuries * p_I * agg_factor * (1 - protective_equipment)
+        processing_risk_hunter <- processing_risk * w_processing * p_P * (1 - protective_equipment)
+        eating_risk_hunter <- eating_risk * w_eating * p_E
+        fomite_risk <- time_in_forest * cont_rate * p_F * w_fomites * P * (1 - protective_equipment)
+        
+        # Risco total caçadores
+        hunter_risk <- time_in_forest * hunting_rate * (
+          injury_risk_component + 
+            processing_risk_hunter + 
+            eating_risk_hunter
+        ) * animal_prop + fomite_risk
+        
+        # Transmissão vetorial
+        vector_seasonal_factor <- 1 + vector_seasonality * sin(2 * pi * (t - 120) / 365)
+        vector_risk_hunter <- time_in_forest * encounters_day * 
+          bite_risk * p_V * animal_prop * vector_seasonal_factor
+        
+        hunter_spillover <- (1 - exp(-hunter_risk)) * Sh
+        vector_spillover <- (1 - exp(-vector_risk_hunter)) * Sh
+        
+        hunter_spillover_prob <- (1 - exp(-hunter_risk))+ (1 - exp(-vector_risk_hunter))
+        
+        dSh <-  -(hunter_spillover + vector_spillover)
+        dIh <-  hunter_spillover + vector_spillover
+      }
+      
+      # ------------------------------------------------------------
+      # DINÂMICA DOS FAMILIARES (CONSUMIDORES)
+      # ------------------------------------------------------------
+      if (hunting_rate > 0) {
+        # Proporção de carne infectada compartilhada
+        prop_infected <- ifelse((Ia + A) > 0, Ia / (Ia + A), 0)
+        shared_meat <- sharing_fraction * hunting_rate * prop_infected
+        
+        # Riscos específicos para consumidores
+        home_processing_risk_component <- shared_meat * home_processing_risk * (1 - home_ppe_effect)
+        home_eating_risk_component <- shared_meat * home_eating_risk * (1 - cooking_protection)
+        
+        consumer_risk <- home_processing_risk_component + home_eating_risk_component
+        
+        consumer_spillover_prob <- (1 - exp(-consumer_risk))
+        
+        consumer_spillover <- (1 - exp(-consumer_risk)) * Sc
+          
+        dSc <-  - consumer_spillover
+        dIc <-  consumer_spillover
+      }
+      
+      # ------------------------------------------------------------
+      # DINÂMICA ANIMAL E AMBIENTAL
+      # ------------------------------------------------------------
+      # Transmissão animal-animal
+      animal_transmission <- ifelse((Ia + A) > 0, 
+                                    lambda_effective * A * (Ia / (Ia + A)), 0)
+      
+      # Migração
+      migration_in <- migration_rate * K_max * 0.1  # 10% dos migrantes são infectados
+      migration_out <- migration_rate * (A + Ia)
+      
+      # Equações diferenciais
+      dA <- r * A * (1 - (A + Ia) / K_effective) - hunting_rate * A - mu * A - 
+        animal_transmission + migration_in * 0.9 - migration_out * (A / (A + Ia + 1e-10))
+      
+      dIa <- animal_transmission - hunting_rate * Ia - mu * Ia + 
+        migration_in * 0.1 - migration_out * (Ia / (A + Ia + 1e-10))
+      
+      dP <- phi * Ia * (1 - (P / P_max)) - nu * P
+      
+      # ------------------------------------------------------------
+      # OUTPUTS ADICIONAIS PARA ANÁLISE
+      # ------------------------------------------------------------
+      list(
+        c(dSh = dSh, dIh = dIh, dSc = dSc, dIc = dIc, 
+          dA = dA, dIa = dIa, dP = dP),
+        
+        # Saídas para análise
+        hunter_spillover = ifelse(exists("hunter_spillover"), hunter_spillover, 0),
+        vector_spillover = ifelse(exists("vector_spillover"), vector_spillover, 0),
+        consumer_spillover = ifelse(exists("consumer_spillover"), consumer_spillover, 0),
+        prop_meat_infected = ifelse((Ia + A) > 0, Ia / (Ia + A), 0),
+        hunting_activity = hunting_rate,
+        K_effective = K_effective,
+        lambda_effective = lambda_effective,
+        time_in_forest = time_in_forest,
+        is_hunting_day = is_hunting_day,
+        weekday = weekday,
+        migration_in = migration_in,
+        migration_out = migration_out, 
+        hunter_spillover_prob = hunter_spillover_prob,
+        consumer_spillover_prob = consumer_spillover_prob
+        
+      )
+    })
+}
+
+#  Função para análise de sensibilidade
+run_sensitivity_analysis <- function(param_name, param_values, base_pars = pars) {
+  results <- map_dfr(param_values, function(val1, val2) {
+    temp_pars <- base_pars
+    temp_pars[[param_name]] <- val
+    
+    out <- ode(y = state, times = tempo[1:100], func = spillover_model, 
+               parms = temp_pars, p_data = precipitation_data$p_normalizado)
+    
+    final_result <- tail(as.data.frame(out), 1)
+    data.frame(
+      parameter_value = val,
+      final_prevalenceA = final_result$Ia / (final_result$A + final_result$Ia),
+      final_prevalenceC = final_result$Ic / (final_result$Sc + final_result$Ic),
+      final_prevalenceH = final_result$Sh / (final_result$Sh + final_result$Ih),
+      total_spillovers = state[1] - final_result$Sh,
+      final_hunters = final_result$Sh,
+      final_animals = final_result$A,
+      final_Ianimals = final_result$Ia
+    )
+  })
+  
+  results$parameter <- param_name
+  return(results)
+}
+```
+
+## Model Simulation
+
+```{r simulation}
+# Run simulation
+out <- ode(y = state, times = tempo, func = spillover_model, 
+           parms = pars, p_data = precipitation_data$p_normalizado)
+
+# Process results
+resultado <- as.data.frame(out) %>%
+  left_join(precipitation_data, by = c("time" = "day")) %>%
+  mutate(Sh = (Sh/100) * 100,
+         prev = Ia / (A + Ia))
+
+# Display sample results
+resultado %>% 
+  select(time, Sh,Ih,Sc,Ic, A, Ia, P, is_hunting_day, time_in_forest) %>%
+  head(10)
+```
+
+
+## Results Visualization
+
+### Model Summary
+```{r model_summary}
+# NOVO: Summary da simulação
+final_state <- tail(resultado, 1)
+cat("=== SIMULATION SUMMARY ===\n")
+cat("Scenario:", current_scenario$name, "\n")
+cat("Simulation period:", n_years, "years (", total_days, "days)\n\n")
+
+cat("FINAL STATE:\n")
+cat("- Susceptible hunters:", round(final_state$Sh, 1), "/", state[1], "\n")
+cat("- Total spillovers:", round(state[1] - final_state$Sh, 1), "\n")
+cat("- Susceptible animals:", round(final_state$A, 0), "\n")
+cat("- Infected animals:", round(final_state$Ia, 0), "\n")
+cat("- Final prevalence:", round(final_state$prev * 100, 2), "%\n")
+cat("- Environmental pathogen load:", round(final_state$P, 2), "\n\n")
+
+cat("SPILLOVER EVENTS:\n")
+hunting_spillovers <- sum(resultado$patho1_spillover_expected[resultado$is_hunting_day == 1], na.rm = TRUE)
+vector_spillovers <- sum(resultado$patho2_spillover_expected[resultado$is_hunting_day == 1], na.rm = TRUE)
+cat("- Hunting-related spillovers:", round(hunting_spillovers, 2), "\n")
+cat("- Vector-mediated spillovers:", round(vector_spillovers, 2), "\n")
+cat("- Total expected spillovers:", round(hunting_spillovers + vector_spillovers, 2), "\n")
+```
+
+### Precipitation Patterns
+```{r precipitation_plots}
+p1 <- precipitation_data %>% 
+  ggplot(aes(x = day, y = precipitation, colour = event, group = 1)) +
+  geom_line() + geom_point(size = 0.5) +
+  labs(y = "Daily precipitation (mm)", x = "Day", col = "") +
+  theme_bw() + theme(legend.position = "top") +
+  scale_color_manual(values = "steelblue")
+
+p2 <- precipitation_data %>%
+  ggplot(aes(x = month, y = precipitation)) +
+  geom_col(fill = "steelblue") +
+  labs(y = "Monthly precipitation (mm)", x = "Month") +
+  theme_bw()
+
+ggarrange(p1, p2, common.legend = TRUE)
+```
+
+### Animal Population Dynamics
+```{r animal_dynamics}
+resultado %>%
+  ggplot() +
+  geom_line(aes(x = time, y = A, col = "Susceptible"), linewidth = 0.7) + 
+  geom_line(aes(x = time, y = Ia, col = "Infected"), linewidth = 0.7) +
+  labs(y = "Animal Population", x = "Time (days)", col = "",
+       subtitle = paste("Initial: Sh =", state[1], ", A =", state[2], 
+                       ", Ia =", state[3])) +
+  scale_color_manual(values = c("Susceptible" = "blue3", "Infected" = "red3")) +
+  theme_bw() + theme(legend.position = "top")
+```
+
+### Pathogen Prevalence
+```{r prevalence, eval=FALSE, include=FALSE}
+resultado %>%
+  ggplot(aes(x = time, y = prev)) +
+  geom_line(linewidth = 1, color = "black") +
+  labs(y = "Pathogen Prevalence", x = "Time (days)") +
+  theme_bw()
+
+# Summary statistics
+cat("Prevalence Summary:\n")
+summary(resultado$prev)
+```
+
+```{r}
+resultado %>% 
+  mutate(p_h = Ih/(Ih+Sh),
+         p_c = Ic/(Ic+Sc),
+         p_a = Ia/(A+Ia)) %>%
+  select(time,p_h,p_c,p_a) %>% 
+  pivot_longer(cols = 2:4, names_to = "prev", values_to = "pct") %>% 
+  ggplot(aes(x = time, y = pct*100, col = prev)) +
+  geom_line()+
+  theme_bw() + theme(legend.position = "top") +
+  labs(x = "Time (days)", y = "Prev %", 
+       subtitle = paste("Initial: Hs =", state[1], ", Hi =", state[2], 
+                       ", Cs  =", state[3], ", Ci  =", state[4],
+                       ", As  =", state[5], ", Ai  =", state[7],
+                       ", P  =", state[7]), color = "Group") +
+  scale_color_manual(values = c("cornflowerblue", "darkolivegreen3",
+                                "goldenrod3"), 
+                     labels = c("Animals","Consumers","Hunters"))
+
+```
+
+### Spillover Events
+```{r spillover_events, eval=FALSE, include=FALSE}
+resultado %>% 
+  filter(is_hunting_day == 1) %>% 
+  ggplot(aes(x = time)) +
+  geom_line(aes(y = hunter_spillover_prob, color = "Hunter"), 
+            linewidth = 0.7) +
+  geom_line(aes(y = consumer_spillover_prob, color = "Consumer"), 
+            linewidth = 0.7) +
+  scale_color_manual(values = c("Hunter" = "#009E73", 
+                               "Consumer" = "#0072B2")) +
+  labs(y = "Expected Spillover Cases", x = "Time (days)", color = "",
+       subtitle = paste("Scenario:", current_scenario$name)) +
+  theme_bw() + theme(legend.position = "top")
+```
+
+### Sensitivity Analysis
+```{r sensitivity_analysis, echo=FALSE}
+# Análise de sensibilidade para parâmetros importantes para transmissão
+sensitivity_params <- list(
+  "h" = seq(0, 0.5, length.out = 40),
+  "lambda_base" = seq(0, 0.6, length.out = 40),
+  "encounters_day" = seq(0, 30, length.out = 40)
+)
+
+sensitivity_results <- map_dfr(names(sensitivity_params), function(param) {
+  run_sensitivity_analysis(param, sensitivity_params[[param]])
+})
+
+# Plot da análise de sensibilidade
+#sensitivity_results %>%
+#  ggplot(aes(x = parameter_value, y = total_spillovers, color = parameter)) +
+#  geom_line(linewidth = 1) + geom_point(size = 2) +
+#  facet_wrap(~parameter, scales = "free_x") +
+#  labs(title = "Sensitivity Analysis: Parameter Impact on Total Spillovers",
+#       x = "Parameter Value", y = "Total Spillover Events", color = "Parameter") +
+#  theme_bw() + theme(legend.position = "none")
+if(F){
+sensitivity_results %>%
+  ggplot(aes(x = parameter_value, y = final_prevalenceH, color = parameter)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(title = "Sensitivity Analysis: Parameter Impact on Final Prevalence",
+       x = "Parameter Value", y = "Prev of Infected hunters", color = "Parameter") +
+  theme_bw() + theme(legend.position = "none")
+
+sensitivity_results %>%
+  ggplot(aes(x = parameter_value, y = final_prevalenceC, color = parameter)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(title = "Sensitivity Analysis: Parameter Impact on Final Prevalence",
+       x = "Parameter Value", y = "Prev of Infected consumers", color = "Parameter") +
+  theme_bw() + theme(legend.position = "none")
+
+sensitivity_results %>%
+  ggplot(aes(x = parameter_value, y = final_prevalenceA, color = parameter)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(title = "Sensitivity Analysis: Parameter Impact on Final Prevalence",
+       x = "Parameter Value", y = "Prev of Infected animals", color = "Parameter") +
+  theme_bw() + theme(legend.position = "none")
+
+sensitivity_results %>%
+  ggplot(aes(x = parameter_value, y = final_Ianimals, color = parameter)) +
+  geom_line(linewidth = 1) + geom_point(size = 2) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(title = "Sensitivity Analysis: Parameter Impact on Final Infected Animals",
+       x = "Parameter Value", y = "Final Infected Animals", color = "Parameter") +
+  theme_bw() + theme(legend.position = "none")
+}
+
+sensitivity_results %>% 
+  pivot_wider(names_from = parameter,values_from = parameter_value) %>% View()
+
+```
+
+```{r}
+# Variação 2 parametros
+
+run_dual_sensitivity_analysis <- function(param1_name, param1_values, param2_name, param2_values, base_pars = pars) {
+  # Criar todas as combinações possíveis dos dois parâmetros
+  param_combinations <- expand.grid(param1 = param1_values, param2 = param2_values)
+  
+  results <- map_dfr(1:nrow(param_combinations), function(i) {
+    temp_pars <- base_pars
+    temp_pars[[param1_name]] <- param_combinations$param1[i]
+    temp_pars[[param2_name]] <- param_combinations$param2[i]
+    
+    out <- ode(y = state, times = tempo[1:100], func = spillover_model, 
+               parms = temp_pars, p_data = precipitation_data$p_normalizado)
+    
+    final_result <- tail(as.data.frame(out), 1)
+    data.frame(
+      param1_value = param_combinations$param1[i],
+      param2_value = param_combinations$param2[i],
+      final_prevalenceA = final_result$Ia / (final_result$A + final_result$Ia),
+      final_prevalenceC = final_result$Ic / (final_result$Sc + final_result$Ic),
+      final_prevalenceH = final_result$Sh / (final_result$Sh + final_result$Ih),
+      total_spillovers = state[1] - final_result$Sh,
+      final_hunters = final_result$Sh,
+      final_animals = final_result$A,
+      final_Ianimals = final_result$Ia
+    )
+  })
+  
+  results$param1_name <- param1_name
+  results$param2_name <- param2_name
+  return(results)
+}
+
+
+# Exemplo de uso:
+ results <- run_dual_sensitivity_analysis(
+   param1_name = "h", 
+   param1_values = seq(0, 0.5, length.out = 40),
+   param2_name = "lambda_base", 
+   param2_values = seq(0, 0.6, length.out = 40),
+   base_pars = pars
+)
+
+```
+
+
+### Risk Decomposition
+```{r risk_decomposition, echo=FALSE}
+# Análise detalhada dos componentes de risco
+risk_data <- resultado %>% 
+  filter(is_hunting_day == 1) %>%
+  mutate(
+    injury_component = hunter_spillover * pars$w_injuries / 
+                      (pars$w_injuries + pars$w_processing + pars$w_eating + 1e-10),
+    processing_component = hunter_spillover * pars$w_processing / 
+                          (pars$w_injuries + pars$w_processing + pars$w_eating + 1e-10),
+    eating_component = hunter_spillover * pars$w_eating / 
+                      (pars$w_injuries + pars$w_processing + pars$w_eating + 1e-10)
+  ) %>%
+  select(time, injury_component, processing_component, eating_component, vector_spillover) %>%
+  pivot_longer(cols = -time, names_to = "risk_type", values_to = "risk_value") %>% 
+  mutate(path_trans = case_when(
+    risk_type == "vector_spillover" ~ "vector",
+    T ~ "Animal direct contact"
+  ))
+
+risk_data %>%
+  ggplot(aes(x = time, y = risk_value, fill = risk_type)) +
+  geom_area(position = "stack", alpha = 0.7) +
+  scale_fill_manual(values = c("injury_component" = "#FF5733",
+                              "processing_component" = "#33FF57", 
+                              "eating_component" = "#3357FF",
+                              "vector_spillover" = "#FF33F5")) +
+  labs(title = "Risk Component Decomposition Over Time",
+       x = "Time (days)", y = "Spillover Risk", fill = "Risk Type") +
+  theme_bw() + 
+  facet_wrap(~path_trans) 
+```
+
+
